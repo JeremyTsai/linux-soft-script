@@ -1,8 +1,7 @@
 #!/bin/bash
 
 #==================================================
-# FRP 一键安装/升级脚本 v3.1 (Bug修复版)
-# 特性：非登录用户、动态防火墙、干净输出
+# FRP 一键安装/升级脚本 v3.2 (修复检测和错误处理)
 #==================================================
 
 set -e
@@ -45,9 +44,19 @@ get_arch() {
     esac
 }
 
-# 检测是否已安装
+# 检测是否已安装（修复：检查二进制文件而非仅目录）
 check_installed() {
-    [[ -d "${FRP_DIR}" ]] && return 0 || return 1
+    # 检查关键文件是否存在且可执行，避免空目录误判
+    if [[ -x "${FRP_DIR}/frps" ]] && [[ -x "${FRP_DIR}/frpc" ]]; then
+        return 0
+    else
+        # 如果目录存在但二进制不存在，可能是之前安装失败的残留，清理掉
+        if [[ -d "${FRP_DIR}" ]] && [[ ! -f "${FRP_DIR}/frps" ]]; then
+            echo -e "${YELLOW}检测到残留空目录，正在清理...${NC}" >&2
+            rm -rf "${FRP_DIR}"
+        fi
+        return 1
+    fi
 }
 
 # 获取已安装版本
@@ -59,28 +68,52 @@ get_installed_version() {
     fi
 }
 
-# 获取最新版本（修复：日志输出到stderr，只返回版本号到stdout）
+# 获取最新版本（修复：增加重试和空值检查）
 get_latest_version() {
     echo -e "${BLUE}正在获取最新版本信息...${NC}" >&2
     
-    local version=$(curl -s --connect-timeout 10 ${GITHUB_API} | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    local version=""
+    local retry_count=0
+    local max_retries=3
+    
+    while [[ -z "${version}" && ${retry_count} -lt ${max_retries} ]]; do
+        # 使用 -m 10 限制最大时间，避免卡死
+        version=$(curl -sL --max-time 10 --retry 3 --retry-delay 2 ${GITHUB_API} | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | tr -d '\n\r ')
+        
+        if [[ -z "${version}" ]]; then
+            ((retry_count++))
+            if [[ ${retry_count} -lt ${max_retries} ]]; then
+                echo -e "${YELLOW}获取失败，${retry_count}秒后重试...${NC}" >&2
+                sleep ${retry_count}
+            fi
+        fi
+    done
     
     if [[ -z "${version}" ]]; then
-        echo -e "${RED}获取最新版本失败，请检查网络连接${NC}" >&2
-        exit 1
+        echo -e "${RED}错误：无法连接到 GitHub API 获取最新版本${NC}" >&2
+        echo -e "${YELLOW}请检查网络连接，或手动指定版本安装${NC}" >&2
+        # 返回空字符串，让调用方处理
+        echo ""
+        return 1
     fi
     
-    # 只输出版本号到stdout，不带颜色，不换行
     printf '%s' "${version}"
 }
 
-# 下载 frp（修复：改进目录检测和版本号处理）
+# 下载 frp（修复：增加版本号空值检查）
 download_frp() {
     local version=$1
     local arch=$(get_arch)
     
-    # 下载URL：注意 ${version#v} 去掉版本号前的v（例如 v0.68.0 -> 0.68.0）
-    local download_url="https://github.com/fatedier/frp/releases/download/${version}/frp_${version#v}_linux_${arch}.tar.gz"
+    # 关键检查：如果版本号为空，直接退出
+    if [[ -z "${version}" ]]; then
+        echo -e "${RED}错误：版本号为空，无法下载${NC}" >&2
+        exit 1
+    fi
+    
+    # 确保版本号格式正确（去掉可能的v前缀用于URL）
+    local version_clean=${version#v}
+    local download_url="https://github.com/fatedier/frp/releases/download/${version}/frp_${version_clean}_linux_${arch}.tar.gz"
     local temp_dir=$(mktemp -d)
     
     echo -e "${BLUE}正在下载 frp ${version} (${arch})...${NC}"
@@ -88,9 +121,9 @@ download_frp() {
     
     cd "${temp_dir}"
     
-    # 下载，使用 -f 确保失败返回非零
-    if ! curl -fL --progress-bar -o frp.tar.gz "${download_url}"; then
-        echo -e "${RED}下载失败！${NC}" >&2
+    # 下载，带重试
+    if ! curl -fL --max-time 60 --retry 3 --retry-delay 2 --progress-bar -o frp.tar.gz "${download_url}"; then
+        echo -e "${RED}下载失败！请检查版本号是否正确: ${version}${NC}" >&2
         rm -rf "${temp_dir}"
         exit 1
     fi
@@ -99,7 +132,7 @@ download_frp() {
     tar -xzf frp.tar.gz
     rm -f frp.tar.gz
     
-    # 查找解压后的目录（避免ls的颜色问题）
+    # 查找解压后的目录
     local extract_dir=$(find . -maxdepth 1 -type d -name "frp_*" | head -1 | sed 's|^\./||')
     
     if [[ -z "${extract_dir}" ]]; then
@@ -108,18 +141,23 @@ download_frp() {
         exit 1
     fi
     
-    # 返回完整路径
+    # 检查关键文件是否存在
+    if [[ ! -f "${temp_dir}/${extract_dir}/frps" ]] || [[ ! -f "${temp_dir}/${extract_dir}/frpc" ]]; then
+        echo -e "${RED}错误：下载的文件不完整，缺少 frps 或 frpc${NC}" >&2
+        rm -rf "${temp_dir}"
+        exit 1
+    fi
+    
     echo "${temp_dir}/${extract_dir}"
 }
 
 #==================================================
-# 用户管理模块（健壮性检查 + 最小权限）
+# 用户管理模块
 #==================================================
 
 setup_frp_user() {
     echo -e "\n${BLUE}=== 用户权限配置 ===${NC}"
     
-    # 检查用户是否已存在
     if id -u "${FRP_USER}" &>/dev/null; then
         echo -e "${YELLOW}用户 ${FRP_USER} 已存在，跳过创建${NC}"
         local current_shell=$(grep "^${FRP_USER}:" /etc/passwd | cut -d: -f7)
@@ -132,7 +170,7 @@ setup_frp_user() {
             fi
         fi
     else
-        echo -e "${BLUE}创建专用用户 ${FRP_USER}...${NC}"
+        echo -e "${BLUE}创建专用用户 ${FRP_USER}（非登录）...${NC}"
         if useradd -r -s /sbin/nologin -M "${FRP_USER}" 2>/dev/null; then
             echo -e "${GREEN}✓ 用户创建成功${NC}"
         else
@@ -165,7 +203,6 @@ setup_frp_user() {
     
     echo -e "${GREEN}✓ 权限配置完成${NC}"
     
-    # 特权端口检查
     check_privileged_ports
 }
 
@@ -269,7 +306,7 @@ configure_firewall() {
         firewall-cmd --reload 2>/dev/null || true
         echo -e "${GREEN}✓ Firewalld 配置完成${NC}"
         
-    elif command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         echo -e "${BLUE}配置 UFW...${NC}"
         for port in ${ports}; do
             ufw allow "${port}" comment 'FRP' 2>/dev/null || true
@@ -284,7 +321,6 @@ configure_firewall() {
             iptables -I INPUT -p "${proto}" --dport "${port_num}" -j ACCEPT 2>/dev/null || true
         done
         echo -e "${GREEN}✓ iptables 配置完成${NC}"
-        echo -e "${YELLOW}注意：iptables 规则重启后可能失效${NC}"
     else
         echo -e "${YELLOW}! 未检测到防火墙工具${NC}"
         echo -e "请手动开放端口：${ports}"
@@ -340,13 +376,6 @@ heartbeatTimeout = 90
 log.to = "./logs/frps.log"
 log.level = "info"
 log.maxDays = 30
-
-# vhostHTTPPort = 80
-# vhostHTTPSPort = 443
-
-# allowPorts = [
-#   { start = 6000, end = 7000 }
-# ]
 EOF
 
     chown "${FRP_USER}:${FRP_USER}" "${FRP_DIR}/frps.toml"
@@ -454,8 +483,19 @@ install_frp() {
         mkdir -p "${FRP_DIR}" "${FRP_BIN_DIR}"
     fi
     
-    # 获取版本（现在返回纯净版本号）
-    local latest_version=$(get_latest_version)
+    # 获取版本（修复：检查返回值）
+    local latest_version
+    if ! latest_version=$(get_latest_version); then
+        echo -e "${RED}无法获取版本信息，安装中止${NC}" >&2
+        exit 1
+    fi
+    
+    # 再次检查版本号是否为空
+    if [[ -z "${latest_version}" ]]; then
+        echo -e "${RED}错误：获取到的版本号为空${NC}" >&2
+        exit 1
+    fi
+    
     echo -e "目标版本: ${GREEN}${latest_version}${NC}"
     
     if [[ "${is_upgrade}" == "true" ]]; then
@@ -470,7 +510,7 @@ install_frp() {
         fi
     fi
     
-    # 下载（传入纯净版本号）
+    # 下载
     local temp_extract_dir=$(download_frp "${latest_version}")
     
     if [[ ! -d "${temp_extract_dir}" ]]; then
@@ -492,7 +532,7 @@ install_frp() {
         create_default_config
     fi
     
-    # 清理临时目录（使用变量的目录部分）
+    # 清理临时目录
     local temp_base=$(dirname "${temp_extract_dir}")
     if [[ -d "${temp_base}" && "${temp_base}" == "/tmp"* ]]; then
         rm -rf "${temp_base}"
@@ -583,7 +623,7 @@ show_menu() {
     while true; do
         clear
         echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}     FRP 安装管理脚本 v3.1${NC}"
+        echo -e "${GREEN}     FRP 安装管理脚本 v3.2${NC}"
         echo -e "${GREEN}========================================${NC}"
         
         local install_status="${RED}未安装${NC}"
@@ -621,7 +661,7 @@ show_menu() {
                 if check_installed; then
                     install_frp "true"
                 else
-                    echo -e "${RED}未安装${NC}"
+                    echo -e "${RED}未安装，无法升级${NC}"
                 fi
                 read -p "按回车继续..."
                 ;;
